@@ -209,6 +209,7 @@ deposit_amount >= rate_per_second * (end_time - start_time)
 | `pause_stream_as_admin`  | Admin             | `admin.require_auth()`     |
 | `resume_stream_as_admin` | Admin             | `admin.require_auth()`     |
 | `cancel_stream_as_admin` | Admin             | `admin.require_auth()`     |
+| `close_completed_stream` | Anyone            | None (permissionless cleanup) |
 
 **Note:** Sender-managed functions (`pause_stream`, `resume_stream`, `cancel_stream`) require sender auth. Admin uses separate `_as_admin` entry points.
 
@@ -256,6 +257,7 @@ Emitted when a recipient successfully withdraws tokens via `withdraw`.
 | `("resumed", stream_id)`   | `StreamEvent::Resumed(stream_id)`   | `resume_stream` / `resume_stream_as_admin` |
 | `("cancelled", stream_id)` | `StreamEvent::Cancelled(stream_id)` | `cancel_stream` / `cancel_stream_as_admin` |
 | `("withdrew", stream_id)`  | `withdrawable` (i128)               | `withdraw`                                 |
+| `("closed", stream_id)`    | `StreamEvent::StreamClosed(stream_id)` | `close_completed_stream`                 |
 
 ---
 
@@ -285,6 +287,7 @@ All failures use `panic!` / `assert!`. No custom error enum.
 | `"nothing to withdraw"`                                                 | `withdraw`                                 | accrued == withdrawn_amount  |
 | `"stream is not active"`                                                | `pause_stream_as_admin`                    | Admin pause non-active       |
 | `"stream is not paused"`                                                | `resume_stream_as_admin`                   | Admin resume non-paused      |
+| `"can only close completed streams"`                                    | `close_completed_stream`                   | Close non-Completed stream   |
 | `"contract not initialised: missing config"`                            | Functions requiring config                 | Config missing               |
 
 ## Error Reference

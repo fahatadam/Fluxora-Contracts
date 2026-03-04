@@ -65,6 +65,7 @@ pub enum StreamEvent {
     Resumed(u64),
     StreamCancelled(u64),
     StreamCompleted(u64),
+    StreamClosed(u64),
 }
 
 #[contracttype]
@@ -219,6 +220,11 @@ fn save_stream(env: &Env, stream: &Stream) {
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
+}
+
+fn remove_stream(env: &Env, stream_id: u64) {
+    let key = DataKey::Stream(stream_id);
+    env.storage().persistent().remove(&key);
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1355,60 @@ impl FluxoraStream {
                 new_end_time,
             },
         );
+
+        Ok(())
+    }
+
+    /// Return the contract version number.
+    ///
+    /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
+    /// Frontends and deployment scripts can call this to confirm which version of the
+    /// contract is currently deployed before interacting with it.
+    ///
+    /// # Returns
+    /// - `u32`: The current contract version (currently `1`)
+    ///
+    /// Close (archive) a completed stream to reduce long-term storage.
+    ///
+    /// Permanently removes the stream's persistent storage entry. Only streams in
+    /// `Completed` status can be closed; all payouts must already have been made.
+    /// After close, the stream is no longer queryable (`get_stream_state` returns
+    /// `StreamNotFound`).
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to close
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success
+    ///
+    /// # Preconditions
+    /// - Stream must exist and have status `Completed`
+    ///
+    /// # Panics
+    /// - If the stream does not exist
+    /// - If the stream is not `Completed` (Active, Paused, or Cancelled)
+    ///
+    /// # Events
+    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal
+    ///
+    /// # Operational guidance
+    /// - Callable by anyone; no authorization required (permissionless cleanup).
+    /// - Indexers and UIs should treat closed stream IDs as non-existent.
+    /// - Do not close streams that might still need historical data for accounting.
+    pub fn close_completed_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+
+        assert!(
+            stream.status == StreamStatus::Completed,
+            "can only close completed streams"
+        );
+
+        env.events().publish(
+            (symbol_short!("closed"), stream_id),
+            StreamEvent::StreamClosed(stream_id),
+        );
+
+        remove_stream(&env, stream_id);
 
         Ok(())
     }

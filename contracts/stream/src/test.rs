@@ -2768,6 +2768,79 @@ fn test_withdraw_not_recipient_unauthorized() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — close_completed_stream (#217)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_close_completed_stream_removes_storage() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    ctx.client().close_completed_stream(&stream_id);
+
+    let result = ctx.client().try_get_stream_state(&stream_id);
+    assert!(result.is_err(), "closed stream must not be queryable");
+}
+
+#[test]
+#[should_panic(expected = "can only close completed streams")]
+fn test_close_completed_stream_rejects_active() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().close_completed_stream(&stream_id);
+}
+
+#[test]
+#[should_panic(expected = "can only close completed streams")]
+fn test_close_completed_stream_rejects_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    ctx.client().close_completed_stream(&stream_id);
+}
+
+#[test]
+fn test_close_completed_stream_emits_event() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    ctx.client().close_completed_stream(&stream_id);
+
+    let events = ctx.env.events().all();
+    assert!(!events.is_empty(), "closed event must be emitted");
+}
+
+#[test]
+fn test_close_completed_stream_second_close_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    ctx.client().close_completed_stream(&stream_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().close_completed_stream(&stream_id);
+    }));
+    assert!(
+        result.is_err(),
+        "second close must panic (stream not found)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests — Issue #37: withdraw reject when stream is Paused
 // ---------------------------------------------------------------------------
 
@@ -7297,8 +7370,7 @@ fn test_shorten_stream_end_time_refunds_unstreamed_and_updates_schedule() {
     ctx.env.ledger().set_timestamp(0);
     let sender_before = ctx.token().balance(&ctx.sender);
 
-    ctx.client()
-        .shorten_stream_end_time(&stream_id, &500u64);
+    ctx.client().shorten_stream_end_time(&stream_id, &500u64);
 
     let sender_after = ctx.token().balance(&ctx.sender);
     // Deposit was 1000, new deposit is 500 → refund 500.
@@ -7320,8 +7392,7 @@ fn test_shorten_stream_end_time_preserves_accrued_at_update_time() {
     assert_eq!(accrued_before, 300);
 
     // Shorten end_time from 1000 → 800; new deposit becomes 800.
-    ctx.client()
-        .shorten_stream_end_time(&stream_id, &800u64);
+    ctx.client().shorten_stream_end_time(&stream_id, &800u64);
 
     // At the same ledger timestamp, accrued must be unchanged.
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
@@ -7342,8 +7413,7 @@ fn test_shorten_stream_end_time_rejects_past_end_time() {
     ctx.env.ledger().set_timestamp(600);
 
     // Attempting to shorten to a time in the past must panic.
-    ctx.client()
-        .shorten_stream_end_time(&stream_id, &500u64);
+    ctx.client().shorten_stream_end_time(&stream_id, &500u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -7372,8 +7442,7 @@ fn test_extend_stream_end_time_preserves_accrued_and_allows_longer_accrual() {
     assert_eq!(accrued_before, 800);
 
     // Extend end_time from 1000 → 2000.
-    ctx.client()
-        .extend_stream_end_time(&stream_id, &2_000u64);
+    ctx.client().extend_stream_end_time(&stream_id, &2_000u64);
 
     // Accrued at the same ledger timestamp (t=800) must remain unchanged.
     let accrued_after = ctx.client().calculate_accrued(&stream_id);
@@ -7386,7 +7455,9 @@ fn test_extend_stream_end_time_preserves_accrued_and_allows_longer_accrual() {
 }
 
 #[test]
-#[should_panic(expected = "deposit_amount must cover total streamable amount for extended schedule")]
+#[should_panic(
+    expected = "deposit_amount must cover total streamable amount for extended schedule"
+)]
 fn test_extend_stream_end_time_rejects_when_deposit_insufficient() {
     let ctx = TestContext::setup();
 
@@ -7394,6 +7465,5 @@ fn test_extend_stream_end_time_rejects_when_deposit_insufficient() {
     let stream_id = ctx.create_default_stream();
 
     // Extending to 2000 seconds would require 2000 tokens, but deposit is only 1000.
-    ctx.client()
-        .extend_stream_end_time(&stream_id, &2_000u64);
+    ctx.client().extend_stream_end_time(&stream_id, &2_000u64);
 }
