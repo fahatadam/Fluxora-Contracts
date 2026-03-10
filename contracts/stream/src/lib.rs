@@ -223,6 +223,14 @@ fn set_stream_count(env: &Env, count: u64) {
     bump_instance_ttl(env);
 }
 
+fn read_global_paused(env: &Env) -> bool {
+    bump_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalPaused)
+        .unwrap_or(false)
+}
+
 fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, ContractError> {
     let key = DataKey::Stream(stream_id);
     let stream: Stream = env
