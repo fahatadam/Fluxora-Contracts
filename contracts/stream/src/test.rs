@@ -8948,3 +8948,532 @@ fn test_top_up_stream_insufficient_balance_reverts_cleanly() {
         "deposit_amount must be unchanged after failed top_up"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — Issue #258: pause_stream / resume_stream sender authorization paths
+//
+// This section provides crisp, explicit coverage for every authorization
+// boundary on pause_stream and resume_stream:
+//
+//   Sender path  : only the stream's original sender may call pause_stream /
+//                  resume_stream.  Recipient and arbitrary third parties must
+//                  be rejected.
+//
+//   Admin path   : only the contract admin may call pause_stream_as_admin /
+//                  resume_stream_as_admin.  Any other address must be rejected.
+//
+//   State guards : pause requires Active; resume requires Paused.  Terminal
+//                  states (Completed, Cancelled) must be rejected on both
+//                  paths.
+//
+// All strict-mode tests use setup_strict() (no mock_all_auths) and supply
+// explicit MockAuth entries so the Soroban auth engine enforces the check.
+// ---------------------------------------------------------------------------
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+/// Create a stream in strict-mode context and return its id.
+/// Authorises only the sender for create_stream + the underlying token transfer.
+fn strict_create_stream(ctx: &TestContext) -> u64 {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender,
+                &ctx.recipient,
+                1000_i128,
+                1_i128,
+                0u64,
+                0u64,
+                1000u64,
+            )
+                .into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    )
+}
+
+/// Authorise sender to call pause_stream in strict mode.
+fn strict_pause_as_sender(ctx: &TestContext, stream_id: u64) {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "pause_stream",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    ctx.client().pause_stream(&stream_id);
+}
+
+// ── resume_stream: sender authorization (strict mode) ───────────────────────
+
+/// Recipient must NOT be able to call resume_stream.
+/// The Soroban auth engine must reject the invocation because the stream's
+/// sender address is required, not the recipient.
+#[test]
+#[should_panic]
+fn test_resume_stream_recipient_unauthorized() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    // Recipient attempts to resume — must be rejected.
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream(&stream_id);
+}
+
+/// An arbitrary third party must NOT be able to call resume_stream.
+#[test]
+#[should_panic]
+fn test_resume_stream_third_party_unauthorized() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    let other = Address::generate(&ctx.env);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &other,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream(&stream_id);
+}
+
+/// The stream's sender MUST be able to call resume_stream successfully.
+/// Verifies: auth accepted, status transitions Active → Paused → Active,
+/// and all other stream fields are unchanged.
+#[test]
+fn test_resume_stream_sender_success_strict() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    let state_paused = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_paused.status, StreamStatus::Paused);
+
+    // Sender authorises resume.
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+    // Invariant: no other fields mutated by resume.
+    assert_eq!(state.stream_id, stream_id);
+    assert_eq!(state.sender, ctx.sender);
+    assert_eq!(state.recipient, ctx.recipient);
+    assert_eq!(state.deposit_amount, 1000);
+    assert_eq!(state.rate_per_second, 1);
+    assert_eq!(state.withdrawn_amount, 0);
+}
+
+/// resume_stream must emit a Resumed event observable by integrators.
+#[test]
+fn test_resume_stream_emits_resumed_event_strict() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream(&stream_id);
+
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::Resumed(stream_id),
+        "resume_stream must publish Resumed(stream_id) event"
+    );
+}
+
+// ── resume_stream_as_admin: admin authorization (strict mode) ────────────────
+
+/// The contract admin MUST be able to call resume_stream_as_admin successfully.
+/// Verifies: auth accepted, status transitions Paused → Active.
+#[test]
+fn test_resume_stream_as_admin_success_strict() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    let state_paused = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_paused.status, StreamStatus::Paused);
+
+    // Admin authorises resume via the admin-specific entrypoint.
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.admin,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+    assert_eq!(state.deposit_amount, 1000);
+}
+
+/// A non-admin address must NOT be able to call resume_stream_as_admin.
+/// This guards the admin override path from privilege escalation.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_non_admin_unauthorized() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    let non_admin = Address::generate(&ctx.env);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+/// The stream's sender must NOT be able to call resume_stream_as_admin.
+/// The sender is not the admin; using the admin entrypoint must be rejected.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_sender_is_not_admin() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    // Sender tries to use the admin entrypoint — must be rejected.
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+/// The recipient must NOT be able to call resume_stream_as_admin.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_recipient_is_not_admin() {
+    use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+
+    let ctx = TestContext::setup_strict();
+    let stream_id = strict_create_stream(&ctx);
+    strict_pause_as_sender(&ctx, stream_id);
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "resume_stream_as_admin",
+            args: (stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+// ── State-boundary guards: pause_stream ─────────────────────────────────────
+
+/// pause_stream on a Completed stream must be rejected.
+/// Completed is a terminal state; no further status transitions are allowed.
+#[test]
+#[should_panic]
+fn test_pause_completed_stream_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Drive stream to Completed by withdrawing everything at end_time.
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    // Attempting to pause a completed stream must panic.
+    ctx.client().pause_stream(&stream_id);
+}
+
+// ── State-boundary guards: pause_stream_as_admin ────────────────────────────
+
+/// pause_stream_as_admin on an already-Paused stream must be rejected.
+/// The admin path enforces the same Active-only precondition as the sender path.
+#[test]
+#[should_panic]
+fn test_pause_stream_as_admin_already_paused_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream(&stream_id);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Second pause via admin path must also be rejected.
+    ctx.client().pause_stream_as_admin(&stream_id);
+}
+
+/// pause_stream_as_admin on a Completed stream must be rejected.
+#[test]
+#[should_panic]
+fn test_pause_stream_as_admin_completed_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+}
+
+/// pause_stream_as_admin on a Cancelled stream must be rejected.
+#[test]
+#[should_panic]
+fn test_pause_stream_as_admin_cancelled_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().cancel_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+}
+
+// ── State-boundary guards: resume_stream_as_admin ───────────────────────────
+
+/// resume_stream_as_admin on an Active (not paused) stream must be rejected.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_active_stream_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+/// resume_stream_as_admin on a Completed stream must be rejected.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_completed_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+/// resume_stream_as_admin on a Cancelled stream must be rejected.
+#[test]
+#[should_panic]
+fn test_resume_stream_as_admin_cancelled_panics() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().cancel_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+
+    ctx.client().resume_stream_as_admin(&stream_id);
+}
+
+// ── Cross-path invariant: sender pause → admin resume and vice-versa ─────────
+
+/// Sender pauses, admin resumes — cross-role lifecycle must work.
+/// Verifies that the two authorization paths are orthogonal and composable.
+#[test]
+fn test_sender_pause_admin_resume_cross_path() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Sender pauses.
+    ctx.client().pause_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Paused
+    );
+
+    // Admin resumes via admin path.
+    ctx.client().resume_stream_as_admin(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+}
+
+/// Admin pauses, sender resumes — cross-role lifecycle must work.
+#[test]
+fn test_admin_pause_sender_resume_cross_path() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Admin pauses via admin path.
+    ctx.client().pause_stream_as_admin(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Paused
+    );
+
+    // Sender resumes via sender path.
+    ctx.client().resume_stream(&stream_id);
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Active
+    );
+}
+
+// ── Observability: events on admin paths ────────────────────────────────────
+
+/// pause_stream_as_admin must emit the same Paused event as the sender path.
+/// Integrators must not need to distinguish which path was used from events alone.
+#[test]
+fn test_pause_stream_as_admin_emits_paused_event() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream_as_admin(&stream_id);
+
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::Paused(stream_id),
+        "pause_stream_as_admin must publish Paused(stream_id) event"
+    );
+}
+
+/// resume_stream_as_admin must emit the same Resumed event as the sender path.
+#[test]
+fn test_resume_stream_as_admin_emits_resumed_event() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().pause_stream(&stream_id);
+    ctx.client().resume_stream_as_admin(&stream_id);
+
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::Resumed(stream_id),
+        "resume_stream_as_admin must publish Resumed(stream_id) event"
+    );
+}
+
+// ── Not-found guard on both paths ───────────────────────────────────────────
+
+/// resume_stream on a non-existent stream_id must return StreamNotFound.
+#[test]
+fn test_resume_stream_not_found_returns_error() {
+    let ctx = TestContext::setup();
+    let result = ctx.client().try_resume_stream(&9999);
+    assert!(result.is_err(), "resume_stream on unknown id must error");
+}
+
+/// resume_stream_as_admin on a non-existent stream_id must return StreamNotFound.
+#[test]
+fn test_resume_stream_as_admin_not_found_returns_error() {
+    let ctx = TestContext::setup();
+    let result = ctx.client().try_resume_stream_as_admin(&9999);
+    assert!(result.is_err(), "resume_stream_as_admin on unknown id must error");
+}
