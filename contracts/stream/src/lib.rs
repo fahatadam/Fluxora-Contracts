@@ -574,6 +574,9 @@ impl FluxoraStream {
     /// - Publishes `created(stream_id, deposit_amount)` event on success
     ///
     /// # Usage Notes
+    /// - Self-streaming is disallowed: `sender` must be different from `recipient`
+    ///   - Violations panic with `"sender and recipient must be different"`
+    ///   - No state is persisted, no tokens move, and no `created` event is emitted
     /// - Transaction is atomic: if token transfer fails, no stream is created
     /// - Stream IDs are sequential starting from 0
     /// - Cliff time enables vesting schedules (no withdrawals before cliff)
@@ -659,6 +662,10 @@ impl FluxoraStream {
     ///
     /// # Authorization
     /// - Requires authorization from the sender address exactly once for the entire batch.
+    ///
+    /// # Usage Notes
+    /// - Each entry is validated with the same rules as `create_stream`
+    /// - Self-streaming is disallowed per entry: `sender` must not equal `recipient`
     pub fn create_streams(
         env: Env,
         sender: Address,
@@ -1281,8 +1288,11 @@ impl FluxoraStream {
     /// - `stream_id`: Unique identifier of the stream
     ///
     /// # Returns
-    /// - `i128`: The amount currently available to withdraw. Returns `0` if the stream
-    ///   is `Paused`, `Completed`, or before the cliff time.
+    /// - `i128`: The amount currently available to withdraw.
+    ///   - Returns `0` if the stream is `Paused` or `Completed` (withdraw is blocked).
+    ///   - Returns `0` before the cliff time or when already fully withdrawn.
+    ///   - For `Active` or `Cancelled` streams, this equals the amount `withdraw()` would return
+    ///     at the current ledger time.
     ///
     /// # Errors
     /// - Returns `ContractError::StreamNotFound` if the stream does not exist.
@@ -1810,9 +1820,8 @@ impl FluxoraStream {
             "can only top up active or paused streams"
         );
 
-        // Pull additional funds into the contract before mutating stream state.
-        pull_token(&env, &funder, amount);
-
+        // CEI: update and persist state BEFORE the external token transfer to reduce
+        // reentrancy risk. This mirrors the pattern used in cancel_stream and withdraw.
         // Increase deposit_amount with overflow protection.
         stream.deposit_amount = stream
             .deposit_amount
@@ -1820,6 +1829,9 @@ impl FluxoraStream {
             .expect("overflow increasing stream deposit_amount");
 
         save_stream(&env, &stream);
+
+        // External token pull happens AFTER state is persisted (CEI-compliant).
+        pull_token(&env, &funder, amount);
 
         env.events().publish(
             (symbol_short!("top_up"), stream_id),
