@@ -8619,3 +8619,107 @@ fn test_recipient_index_binary_search_edge_cases() {
         assert_eq!(empty_streams.len(), 0);
     });
 }
+// ---------------------------------------------------------------------------
+// Tests — Overflow Protection (Issue: create_streams total deposit overflow)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_stream_total_streamable_overflow() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // rate=i128::MAX, duration=2s => rate * duration overflows i128
+    let result = ctx.client().try_create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &i128::MAX,
+        &i128::MAX,
+        &0u64,
+        &0u64,
+        &2u64,
+    );
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        Ok(Error::from_contract_error(
+            ContractError::ArithmeticOverflow as u32
+        ))
+    );
+}
+
+#[test]
+fn test_create_streams_batch_deposit_overflow() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let mut streams = Vec::new(&ctx.env);
+
+    // Two streams each with half+1 of i128::MAX deposit
+    let half_max = i128::MAX / 2 + 1;
+
+    streams.push_back(CreateStreamParams {
+        recipient: ctx.recipient.clone(),
+        deposit_amount: half_max,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 10,
+    });
+
+    streams.push_back(CreateStreamParams {
+        recipient: ctx.recipient.clone(),
+        deposit_amount: half_max,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 10,
+    });
+
+    let result = ctx.client().try_create_streams(&ctx.sender, &streams);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        Ok(Error::from_contract_error(
+            ContractError::ArithmeticOverflow as u32
+        ))
+    );
+}
+
+#[test]
+fn test_top_up_stream_overflow() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Mint just enough to hit i128::MAX total (sender already has 10_000)
+    let amount_to_mint = i128::MAX - 10_000;
+    ctx.sac.mint(&ctx.sender, &amount_to_mint);
+
+    // Create a stream with a large deposit
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &(i128::MAX - 100),
+        &1,
+        &0,
+        &0,
+        &10,
+    );
+
+    // Top up by more than 100 should overflow
+    let result = ctx
+        .client()
+        .try_top_up_stream(&stream_id, &ctx.sender, &101);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        Ok(Error::from_contract_error(
+            ContractError::ArithmeticOverflow as u32
+        ))
+    );
+}

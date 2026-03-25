@@ -60,6 +60,8 @@ pub enum ContractError {
     ContractPaused = 4,
     /// Start time is before the current ledger timestamp.
     StartTimeInPast = 5,
+    /// Arithmetic overflow in stream calculations (e.g. deposit total).
+    ArithmeticOverflow = 6,
 }
 
 #[contracttype]
@@ -409,9 +411,9 @@ impl FluxoraStream {
 
         // Validate deposit covers total streamable amount (#34)
         let duration = (end_time - start_time) as i128;
-        let total_streamable = rate_per_second
-            .checked_mul(duration)
-            .expect("overflow calculating total streamable amount");
+        let total_streamable = rate_per_second.checked_mul(duration).unwrap_or_else(|| {
+            panic_with_error!(env, ContractError::ArithmeticOverflow);
+        });
         assert!(
             deposit_amount >= total_streamable,
             "deposit_amount must cover total streamable amount (rate * duration)"
@@ -681,7 +683,9 @@ impl FluxoraStream {
             );
             total_deposit = total_deposit
                 .checked_add(params.deposit_amount)
-                .expect("overflow calculating total batch deposit");
+                .unwrap_or_else(|| {
+                    panic_with_error!(env, ContractError::ArithmeticOverflow);
+                });
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas
@@ -1504,7 +1508,9 @@ impl FluxoraStream {
         let duration = (stream.end_time - stream.start_time) as i128;
         let total_streamable = new_rate_per_second
             .checked_mul(duration)
-            .expect("overflow calculating total streamable amount for new rate");
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
         assert!(
             stream.deposit_amount >= total_streamable,
             "deposit_amount must cover total streamable amount for new rate"
@@ -1600,7 +1606,9 @@ impl FluxoraStream {
         let new_max_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .expect("overflow calculating total streamable amount for shortened schedule");
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -1703,7 +1711,9 @@ impl FluxoraStream {
         let new_total_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .expect("overflow calculating total streamable amount for extended schedule");
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         assert!(
             new_total_streamable <= stream.deposit_amount,
@@ -1773,14 +1783,20 @@ impl FluxoraStream {
             "can only top up active or paused streams"
         );
 
-        // Pull additional funds into the contract before mutating stream state.
-        pull_token(&env, &funder, amount);
-
-        // Increase deposit_amount with overflow protection.
-        stream.deposit_amount = stream
+        // Increase deposit_amount with overflow protection BEFORE pulling tokens.
+        // This ensures we fail with ArithmeticOverflow if the new total exceeds i128::MAX,
+        // and avoid a redundant (and potentially failing) token transfer.
+        let new_deposit_amount = stream
             .deposit_amount
             .checked_add(amount)
-            .expect("overflow increasing stream deposit_amount");
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
+
+        // Pull additional funds into the contract.
+        pull_token(&env, &funder, amount);
+
+        stream.deposit_amount = new_deposit_amount;
 
         save_stream(&env, &stream);
 
