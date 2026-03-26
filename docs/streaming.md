@@ -191,8 +191,19 @@ return min(accrued, deposit_amount).max(0)
 - **No cliff:** Set `cliff_time = start_time` for immediate vesting
 - **After end_time:** Elapsed time is capped at `end_time` (no post-end accrual)
 - **Overflow:** Multiplication overflow yields `deposit_amount` (safe upper bound)
-- **Completed:** `calculate_accrued` returns `deposit_amount` (deterministic final value)
+- **Active streams:** Accrual computed using current ledger timestamp
+- **Paused streams:** Accrual computed using current ledger timestamp (same as Active; pause only blocks withdrawals, not accrual)
+- **Completed:** `calculate_accrued` returns `deposit_amount` (deterministic final value, timestamp-independent)
 - **Cancelled:** `calculate_accrued` is frozen at `cancelled_at` (no post-cancel growth)
+
+### Status-Specific Behavior Matrix
+
+| Status     | Time Source            | Expected Behavior                         |
+|------------|------------------------|-------------------------------------------|
+| Active     | env.ledger().timestamp| Accrual grows with wall-clock time        |
+| Paused     | env.ledger().timestamp| Same as Active (accrual continues)        |
+| Completed  | N/A (ignored)         | Returns deposit_amount (deterministic)    |
+| Cancelled  | cancelled_at          | Frozen at cancellation time               |
 
 ### Withdrawable Amount
 
