@@ -944,11 +944,11 @@ impl FluxoraStream {
     /// - This prevents anyone from withdrawing on behalf of the recipient
     ///
     /// # Zero Withdrawable Behavior
-    /// - If `accrued == withdrawn_amount` (nothing to withdraw), returns 0 immediately
-    /// - No token transfer occurs, no state change, no event published
-    /// - This is idempotent: safe to call multiple times without side effects
-    /// - Occurs before cliff time or when all accrued funds already withdrawn
-    /// - Frontends can call withdraw without pre-checking balance
+    /// - If `accrued == withdrawn_amount` (nothing to withdraw), returns 0 immediately.
+    /// - No token transfer occurs, no state is modified or saved, and no events are published.
+    /// - This is idempotent: safe to call continuously without state churn or cost footprint.
+    /// - Occurs before cliff, after a full claim, or when the stream is already drained to its cancellation point.
+    /// - Frontends and indexers can safely poll `withdraw` without pre-checking the balance.
     ///
     /// # Panics
     /// - If the stream is `Completed` (all tokens already withdrawn)
@@ -1172,6 +1172,11 @@ impl FluxoraStream {
     /// A `Completed` stream in the batch does **not** panic. It contributes a zero-amount
     /// result and is skipped silently. This allows callers to pass a mixed list of active
     /// and already-completed streams without pre-filtering.
+    ///
+    /// # Zero Withdrawable Behavior
+    /// - If an individual stream has `withdrawable == 0` (before cliff, or fully drained), it is skipped.
+    /// - No token transfer, state modification, or event emission occurs for that specific stream.
+    /// - The batch simply returns `amount: 0` for that stream in the `BatchWithdrawResult` array.
     ///
     /// # Authorization
     /// - Requires authorization from `recipient` once for the entire batch

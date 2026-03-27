@@ -369,6 +369,28 @@ Scope note: these guarantees are limited to `create_streams` creation semantics.
 - Cancelled streams may still be withdrawn (accrued portion), but status remains `Cancelled`.
 - Event ordering on active final drain: `withdrew` is emitted before `completed`.
 
+### Withdrawal Idempotency Requirements (Issue Scope)
+
+This section is the protocol-level contract for the idempotency of the `withdraw`, `withdraw_to`, and `batch_withdraw` endpoints.
+
+Success semantics (observable):
+
+1. Preconditions: Caller must authorize as the stream's `recipient`.
+2. Execution: The `withdrawable` amount evaluated is precisely `0`.
+3. Return: The call succeeds immediately and returns `0` (`amount: 0` in batch results).
+4. State Change Avoidance: No underlying token transfer is attempted. The stream entity is strictly read-only; no TTL bumps, `withdrawn_amount` mutations, or status transitions are committed to the ledger.
+5. Event Avoidance: Absolutely zero events are emitted for the zero-amount stream (no `withdrew`, no `completed`, no `wdraw_to`).
+
+Edge cases guaranteed to behave idempotently:
+
+1. **Before Cliff:** Polling `withdraw` when `current_time < cliff_time` yields `0` and incurs zero churn.
+2. **Double Claim:** Polling `withdraw` instantly multiple times in the same ledger yields `0` on subsequent calls.
+3. **Cancelled Tail:** Calling `withdraw` on a `Cancelled` stream where the frozen accrued amount was already claimed previously yields `0`.
+4. **Completed Pass-through:** Calling `batch_withdraw` containing streams that are already `Completed` silently skips them, producing `amount: 0` in the results array with zero event emission or panics.
+
+Scope boundary: Frontends and indexers should assume it is profoundly safe and intentionally cheap to optimistically poll `withdraw` and `batch_withdraw` without reading the stream balance first.
+
+
 ---
 
 ## 5. Events

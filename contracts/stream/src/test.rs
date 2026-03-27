@@ -14573,3 +14573,127 @@ fn test_create_streams_batch_deposit_overflow_is_atomic() {
         "stream count must not change on overflow failure"
     );
 }
+
+/// zero-withdrawable idempotency: withdraw before cliff returns 0, no state churn, no events
+#[test]
+fn test_withdraw_idempotent_before_cliff_no_events_no_state_change() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64, // Cliff at 500
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(499); // Before cliff
+
+    let events_before = ctx.env.events().all().len();
+    let state_before = ctx.client().get_stream_state(&stream_id);
+
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 0);
+
+    let events_after = ctx.env.events().all().len();
+    assert_eq!(events_before, events_after, "no events should be emitted");
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_before.withdrawn_amount, state_after.withdrawn_amount);
+    assert_eq!(state_before.status, state_after.status);
+}
+
+/// zero-withdrawable idempotency: double claiming returns 0, no events
+#[test]
+fn test_withdraw_idempotent_when_accrued_already_withdrawn_no_events() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(500);
+
+    // Initial claim
+    let withdrawn1 = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn1, 500);
+
+    let events_before = ctx.env.events().all().len();
+    let state_before = ctx.client().get_stream_state(&stream_id);
+
+    // Double claim at the exact same ledger time
+    let withdrawn2 = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn2, 0);
+
+    let events_after = ctx.env.events().all().len();
+    assert_eq!(
+        events_before, events_after,
+        "no events should be emitted for empty claim"
+    );
+
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_before.withdrawn_amount, state_after.withdrawn_amount);
+}
+
+/// batch_withdraw idempotency: skips already Completed and zero-amount streams
+#[test]
+fn test_batch_withdraw_idempotent_zero_withdrawable_and_completed_no_events() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+    let stream2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64,
+        &1000u64,
+    );
+
+    // Drain stream1 to completion
+    ctx.env.ledger().set_timestamp(1000);
+    let withdrawn1 = ctx.client().withdraw(&stream1);
+    assert_eq!(withdrawn1, 1000);
+
+    let state1 = ctx.client().get_stream_state(&stream1);
+    assert_eq!(state1.status, StreamStatus::Completed);
+
+    // Now call batch_withdraw for both stream1 (Completed) and stream2 (Active, has withdrawable)
+    let stream_ids = soroban_sdk::vec![&ctx.env, stream1, stream2];
+
+    let events_before = ctx.env.events().all().len();
+
+    let results = ctx.client().batch_withdraw(&ctx.recipient, &stream_ids);
+
+    // Assert results
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get_unchecked(0).stream_id, stream1);
+    assert_eq!(results.get_unchecked(0).amount, 0); // Idempotent 0
+    assert_eq!(results.get_unchecked(1).stream_id, stream2);
+    assert_eq!(results.get_unchecked(1).amount, 1000); // The active stream drains
+
+    // Assert events: 3 events should be emitted for stream2 (transfer, withdrew, completed)
+    // No events should be emitted for stream1.
+    let events_after = ctx.env.events().all().len();
+    assert_eq!(events_after - events_before, 3);
+}
