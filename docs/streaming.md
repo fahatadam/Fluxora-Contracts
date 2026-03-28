@@ -94,6 +94,35 @@ Scope boundary and exclusions:
 2. Out of scope: token-level trust assumptions beyond documented model, off-chain indexer liveness, and economic policy choices (for example who should bear operational costs).
 3. Residual risk: if a non-standard token violates SEP-41 expectations, transfer behavior may diverge; CEI ordering reduces but cannot fully eliminate external token risk.
 
+### Global Pause Semantics (Issue Scope)
+
+This section is the protocol-level contract for the global pause state managed via `set_contract_paused`.
+
+Success semantics (observable):
+
+1. Preconditions: Caller must be the authorized contract `admin`.
+2. Storage: The `GlobalPaused` data key is set to `true` or `false` in instance storage.
+3. Event: `ContractPaused(bool)` is emitted with topic `("paused_ctl",)`.
+4. Effect on creation: When paused, `create_stream` and `create_streams` return `ContractError::ContractPaused` and all new stream creation is blocked.
+5. Effect on existing streams: Active streams are intentionally unaffected. Withdrawals, top-ups, pause/resume/cancel operations on individual streams continue to function normally.
+
+Failure semantics (observable):
+
+1. Unauthorized caller on admin path: authorization failure from `admin.require_auth()`.
+2. Any failure is atomic: no storage mutation, no event emitted.
+
+Role boundaries:
+
+1. `set_contract_paused`: only the contract `admin` can authorize.
+2. Senders and recipients cannot pause the global contract. Senders manage individual streams via `pause_stream`.
+
+Invariants when globally paused:
+
+1. No new streams can be persisted (no `created` events, no deposit tokens pulled).
+2. Existing streams do not change status due to a global pause.
+
+Scope boundary: The global pause is strictly an administrative circuit breaker for new liabilities. It does not freeze funds of existing users or prevent recipients from withdrawing their vested entitlement.
+
 ```mermaid
 stateDiagram-v2
     direction LR

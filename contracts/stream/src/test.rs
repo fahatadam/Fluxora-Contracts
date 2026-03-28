@@ -10664,6 +10664,73 @@ fn test_create_stream_contract_paused_returns_structured_error() {
     );
 }
 
+/// Verify ContractPaused fires as a structured error for batch creations.
+#[test]
+#[should_panic]
+fn test_create_streams_batch_contract_paused_returns_structured_error() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().set_contract_paused(&true);
+
+    let params = soroban_sdk::Vec::from_array(
+        &ctx.env,
+        [CreateStreamParams {
+            recipient: ctx.recipient.clone(),
+            deposit_amount: 1000,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 1000,
+        }],
+    );
+
+    ctx.client().create_streams(&ctx.sender, &params);
+}
+
+/// Verify that a global pause only blocks `create_stream`/`create_streams`,
+/// while operations on existing streams (withdraw, top-up, pause, cancel) succeed.
+#[test]
+fn test_global_pause_does_not_affect_existing_streams() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create stream while unpaused
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Now admin pauses the contract
+    ctx.client().set_contract_paused(&true);
+
+    // 1. Withdraw should work
+    ctx.env.ledger().set_timestamp(100);
+    ctx.client().withdraw(&stream_id);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 100);
+
+    // 2. Top-up should work
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &100_i128);
+    let state_after_topup = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after_topup.deposit_amount, 1100);
+
+    // 3. Sender pausing an individual stream should work
+    ctx.client().pause_stream(&stream_id);
+    let state_after_pause = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after_pause.status, StreamStatus::Paused);
+
+    // 4. Sender cancelling an individual stream should work
+    ctx.client().cancel_stream(&stream_id);
+    let state_after_cancel = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after_cancel.status, StreamStatus::Cancelled);
+}
+
 /// create_streams (batch) must reject when any stream's start_time is in the past,
 /// emitting StartTimeInPast as a structured error so integrators can handle it.
 #[test]

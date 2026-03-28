@@ -767,6 +767,15 @@ impl FluxoraStream {
     /// The validations above (`deposit > 0`, `rate > 0`, `deposit >= rate × duration`,
     /// valid time window) are the contract's complete set of creation constraints.
     ///
+    ///
+    /// # Errors
+    /// Returns `ContractError` if:
+    /// - `ContractPaused` (4): Operations are globally halted; new streams cannot be created.
+    /// - `InvalidParams` (3): Negative values, zero durations, or insufficient starting deposit.
+    /// - `StartTimeInPast` (5): The `start_time` is strictly before the current ledger timestamp.
+    /// - `ArithmeticOverflow` (6): Value conversions or deposit sum exceeds safe capacities.
+    /// - `Unauthorized` (7): Sender signature is missing.
+    ///
     /// # Examples
     /// - Linear stream: 1000 tokens over 1000 seconds, no cliff
     ///   - `deposit_amount = 1000`, `rate = 1`, `start = 0`, `cliff = 0`, `end = 1000`
@@ -842,6 +851,15 @@ impl FluxoraStream {
     /// # Failure Semantics
     /// - Any validation failure, arithmetic overflow, auth failure, or token transfer failure aborts the call
     /// - On failure there are no persistent writes, no token movement, and no `created` events
+    /// - If the contract is globally paused (`ContractPaused`), the entire batch is rejected
+    ///
+    /// # Errors
+    /// Returns `ContractError` if:
+    /// - `ContractPaused` (4): Operations are globally halted; batch creation is completely blocked.
+    /// - `InvalidParams` (3): An entry contains negative values, zero durations, etc.
+    /// - `StartTimeInPast` (5): An entry's `start_time` is before the current ledger timestamp.
+    /// - `ArithmeticOverflow` (6): Value conversions or total batch deposit exceeds `i128::MAX`.
+    /// - `Unauthorized` (7): Sender signature is missing.
     ///
     /// # Panics
     /// - If any entry violates `create_stream` validation rules
