@@ -25,8 +25,52 @@ const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
 
 /// Compile-time contract version number.
 ///
-/// Increment this constant whenever a breaking change is deployed so that
-/// frontends and scripts can detect which version is running on-chain.
+/// This constant is embedded in the WASM binary at compile time and returned
+/// by the permissionless `version()` entry-point. It is the single source of
+/// truth that integrators, deployment scripts, and indexers use to detect
+/// which protocol revision is running on-chain.
+///
+/// # Versioning policy
+///
+/// | Change type | Action required |
+/// |-------------|-----------------|
+/// | Breaking ABI change (renamed/removed entry-point, changed parameter order, changed error codes, changed event shape) | Increment `CONTRACT_VERSION` |
+/// | New entry-point that is purely additive (old clients can ignore it) | Increment `CONTRACT_VERSION` (conservative; recommended) |
+/// | Internal refactor with identical external behaviour | No increment required |
+/// | Documentation-only change | No increment required |
+///
+/// ## What counts as breaking
+/// - Removing or renaming a public function
+/// - Changing the type or order of any function parameter
+/// - Changing a `ContractError` discriminant value
+/// - Changing the shape of an emitted event payload (`StreamCreated`, `Withdrawal`, etc.)
+/// - Changing storage key layout in a way that makes existing persistent entries unreadable
+///
+/// ## What does NOT require an increment
+/// - Adding a new public function (additive)
+/// - Tightening validation (e.g. rejecting a previously-accepted edge case) — but document it
+/// - Gas optimisations with identical observable behaviour
+/// - Changing TTL bump constants
+///
+/// # Migration notes for operators
+///
+/// Soroban contracts are **not upgradeable in-place** by default. A new version means:
+/// 1. Deploy a new contract instance (new `CONTRACT_ID`).
+/// 2. Call `init` on the new instance with the same token and admin.
+/// 3. Migrate active streams off-chain: cancel or let them complete on the old instance,
+///    then recreate on the new instance if needed.
+/// 4. Update all integrations (wallets, indexers, treasury tooling) to point at the new
+///    `CONTRACT_ID` and verify `version()` returns the expected value before use.
+/// 5. Announce the migration with sufficient lead time so recipients can withdraw
+///    accrued funds from the old instance before it is abandoned.
+///
+/// There is no on-chain migration path between versions. All stream state is local to
+/// the contract instance that created it.
+///
+/// # Residual risk
+/// - If an operator forgets to increment this constant before deploying a breaking change,
+///   integrators will not detect the incompatibility until a runtime failure occurs.
+///   Code review and CI checks on this constant are the primary safeguard.
 pub const CONTRACT_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -2083,20 +2127,33 @@ impl FluxoraStream {
         Ok(())
     }
 
-    /// Return the contract version number.
+    /// Return the compile-time contract version number.
     ///
-    /// Reads the compile-time `CONTRACT_VERSION` constant — no storage access required.
-    /// Frontends and deployment scripts can call this to confirm which version of the
-    /// contract is currently deployed before interacting with it.
+    /// This is a permissionless, read-only entry-point that returns the value of
+    /// [`CONTRACT_VERSION`]. No storage access is performed; the value is embedded
+    /// in the WASM binary at compile time.
     ///
     /// # Returns
     /// - `u32`: The current contract version (currently `1`)
     ///
-    /// # Usage Notes
-    /// - This is a view function (read-only, no state changes)
-    /// - No authorization required (public information)
-    /// - Version is a compile-time constant; calling this costs minimal gas
-    /// - Increment `CONTRACT_VERSION` and redeploy when introducing breaking changes
+    /// # Authorization
+    /// - None required. Any caller (wallet, indexer, script) may call this.
+    ///
+    /// # Usage
+    /// Deployment scripts and integrators should call `version()` immediately after
+    /// obtaining a contract address to confirm the expected protocol revision is
+    /// running before sending any state-mutating transactions.
+    ///
+    /// ```text
+    /// assert version() == EXPECTED_VERSION, "wrong contract version"
+    /// ```
+    ///
+    /// # Availability
+    /// `version()` works even on an uninitialised contract (before `init` is called).
+    /// This allows pre-flight version checks during deployment pipelines.
+    ///
+    /// # Gas
+    /// Minimal — no storage reads, no token interactions.
     pub fn version(_env: Env) -> u32 {
         CONTRACT_VERSION
     }
