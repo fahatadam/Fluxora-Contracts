@@ -32,29 +32,24 @@ No hidden rules or implementation details are required to understand protocol be
 
 ### Phases
 
-| Phase            | Action                                     | Notes                                                                   |
-| ---------------- | ------------------------------------------ | ----------------------------------------------------------------------- |
-| **Creation**     | `create_stream`                            | Sender deposits tokens; stream starts as `Active`                       |
-| **Pause**        | `pause_stream` / `pause_stream_as_admin`   | Stops withdrawals; accrual continues by time                            |
-| **Resume**       | `resume_stream` / `resume_stream_as_admin` | Restores withdrawals                                                    |
-| Phase            | Action                                     | Notes                                                                   |
-| ---------------- | ------------------------------------------ | ----------------------------------------------------------------------- |
-| **Creation**     | `create_stream`                            | Sender deposits tokens; stream starts as `Active`                       |
-| **Pause**        | `pause_stream` / `pause_stream_as_admin`   | Stops withdrawals; accrual continues by time                            |
-| **Resume**       | `resume_stream` / `resume_stream_as_admin` | Restores withdrawals                                                    |
-| **Cancellation** | `cancel_stream` / `cancel_stream_as_admin` | Refunds unstreamed amount to sender; accrued amount stays for recipient |
-| **Withdrawal**   | `withdraw`                                 | Recipient pulls accrued tokens                                          |
-| **Completion**   | Automatic                                  | When `withdrawn_amount == deposit_amount`, status becomes `Completed`   |
-| **Withdrawal**   | `withdraw`                                 | Recipient pulls accrued tokens                                          |
-| **Completion**   | Automatic                                  | When `withdrawn_amount == deposit_amount`, status becomes `Completed`   |
+| Phase            | Action                                        | Notes                                                                 |
+| ---------------- | --------------------------------------------- | --------------------------------------------------------------------- |
+| **Creation**     | `create_stream`                               | Sender deposits tokens; stream starts as `Active`                     |
+| **Top-up**       | `top_up_stream`                               | Extra deposit locked (sender or admin only); schedule unchanged       |
+| **Pause**        | `pause_stream` / `pause_stream_as_admin`      | Stops withdrawals; accrual continues by time                          |
+| **Resume**       | `resume_stream` / `resume_stream_as_admin`    | Restores withdrawals; blocked if past `end_time` (Terminal)           |
+| **Cancellation** | `cancel_stream` / `cancel_stream_as_admin`    | Refunds unstreamed amount; frozen accrued stays for recipient         |
+| **Withdrawal**   | `withdraw` / `withdraw_to` / `batch_withdraw` | Recipient pulls accrued tokens; allowed on Paused if past `end_time`  |
+| **Completion**   | Automatic                                     | When `withdrawn_amount == deposit_amount`, status becomes `Completed` |
 
 ### State Transitions
 
 - **Active** ↔ **Paused** (via pause/resume)
 - **Active** or **Paused** → **Cancelled** (terminal)
-- **Active** → **Completed** (when recipient withdraws full deposit; terminal)
+- **Active** or **Paused** → **Completed** (when recipient withdraws full deposit; terminal)
 
-Terminal states: `Completed`, `Cancelled`. They cannot transition to any other state.
+Terminal states: `Completed`, `Cancelled`. A stream is also considered technically terminal if `ledger.timestamp() >= end_time`.
+In this "time-terminal" state, pause/resume is blocked, but withdrawal is always allowed regardless of previous pause status.
 
 ### Cancellation Semantics (Issue Scope)
 
@@ -73,9 +68,12 @@ Failure semantics (observable):
 
 1. Missing stream: `ContractError::StreamNotFound`.
 2. Non-cancellable status (`Completed` or already `Cancelled`): `ContractError::InvalidState`.
-3. Unauthorized caller on sender path: authorization failure from `sender.require_auth()`.
-4. Unauthorized caller on admin path: authorization failure from `admin.require_auth()`.
-5. Any failure is atomic: no refund transfer, no state mutation, no cancel event.
+3. Modification in terminal state (past `end_time` for pause/resume): `ContractError::StreamTerminalState`.
+4. Unauthorized caller on sender path: `ContractError::Unauthorized`.
+5. Unauthorized caller on admin path: `ContractError::Unauthorized`.
+6. Redundant state change (pause already paused): `ContractError::StreamAlreadyPaused`.
+7. Redundant state change (resume already active): `ContractError::StreamNotPaused`.
+8. Any failure is atomic: no refund transfer, no state mutation, no cancel event.
 
 Role boundaries:
 
@@ -152,7 +150,15 @@ sequenceDiagram
     Note right of Contract: Event: ("paused", stream_id)
 
     Recipient ->> Contract: withdraw(stream_id)
-    Contract --x Recipient: panic: "cannot withdraw from paused stream"
+    Contract --x Recipient: Error: InvalidState (if before end_time)
+
+    Note over Sender, Recipient: 4b. Terminal Liquidity (Paused past end_time)
+    Note right of Contract: Time >= end_time
+    Recipient ->> Contract: withdraw(stream_id)
+    Contract ->> Contract: status = Completed
+    Contract ->> Token: transfer(contract → recipient, total)
+    Contract -->> Recipient: OK
+    Note right of Contract: Event: ("completed", stream_id)
 
     Sender ->> Contract: resume_stream(stream_id)
     Contract ->> Contract: require_auth(sender)<br/>status = Active
@@ -412,32 +418,28 @@ Integrators should treat `ContractError` as stable error codes, and panic string
 as best-effort diagnostics. The table below focuses on creation and lifecycle
 errors relevant to stream creation and timing.
 
-| Message                                                                 | Function                                   | Trigger                                       |
-| ----------------------------------------------------------------------- | ------------------------------------------ | --------------------------------------------- |
-| `"already initialised"`                                                 | `init`                                     | Re-init attempt                               |
-| authorization failure                                                   | `init`                                     | caller did not satisfy `admin.require_auth()` |
-| `"deposit_amount must be positive"`                                     | `create_stream` / `create_streams`         | deposit_amount <= 0                           |
-| `"rate_per_second must be positive"`                                    | `create_stream` / `create_streams`         | rate_per_second <= 0                          |
-| `"sender and recipient must be different"`                              | `create_stream` / `create_streams`         | sender == recipient                           |
-| `"start_time must be before end_time"`                                  | `create_stream` / `create_streams`         | start_time >= end_time                        |
-| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream` / `create_streams`         | cliff out of range                            |
-| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream` / `create_streams`         | underfunded                                   |
-| `"overflow calculating total streamable amount"`                        | `create_stream` / `create_streams`         | overflow in rate \* duration                  |
-| `"overflow calculating total batch deposit"`                            | `create_streams`                           | overflow in sum of deposits                   |
-| `ContractError::StartTimeInPast`                                        | `create_stream` / `create_streams`         | start_time < ledger timestamp                 |
-| `"stream not found"`                                                    | Various                                    | Invalid stream_id                             |
-| `"stream is already paused"`                                            | `pause_stream`                             | Double pause                                  |
-| `"stream must be active to pause"`                                      | `pause_stream`                             | Pause non-active stream                       |
-| `"stream is active, not paused"`                                        | `resume_stream`                            | Resume active stream                          |
-| `"stream is completed"`                                                 | `resume_stream`                            | Resume completed                              |
-| `"stream is cancelled"`                                                 | `resume_stream`                            | Resume cancelled                              |
-| `"stream must be active or paused to cancel"`                           | `cancel_stream` / `cancel_stream_as_admin` | Cancel completed/cancelled                    |
-| `"stream already completed"`                                            | `withdraw`                                 | Withdraw from completed                       |
-| `"cannot withdraw from paused stream"`                                  | `withdraw`                                 | Withdraw while paused                         |
-| `"stream is not active"`                                                | `pause_stream_as_admin`                    | Admin pause non-active                        |
-| `"stream is not paused"`                                                | `resume_stream_as_admin`                   | Admin resume non-paused                       |
-| `"can only close completed streams"`                                    | `close_completed_stream`                   | Close non-Completed stream                    |
-| `"contract not initialised: missing config"`                            | Functions requiring config                 | Config missing                                |
+| Message                                                                 | Function                           | Trigger                                       |
+| ----------------------------------------------------------------------- | ---------------------------------- | --------------------------------------------- |
+| `"already initialised"`                                                 | `init`                             | Re-init attempt                               |
+| authorization failure                                                   | `init`                             | caller did not satisfy `admin.require_auth()` |
+| `"deposit_amount must be positive"`                                     | `create_stream` / `create_streams` | deposit_amount <= 0                           |
+| `"rate_per_second must be positive"`                                    | `create_stream` / `create_streams` | rate_per_second <= 0                          |
+| `"sender and recipient must be different"`                              | `create_stream` / `create_streams` | sender == recipient                           |
+| `"start_time must be before end_time"`                                  | `create_stream` / `create_streams` | start_time >= end_time                        |
+| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream` / `create_streams` | cliff out of range                            |
+| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream` / `create_streams` | underfunded                                   |
+| `"overflow calculating total streamable amount"`                        | `create_stream` / `create_streams` | overflow in rate \* duration                  |
+| `"overflow calculating total batch deposit"`                            | `create_streams`                   | overflow in sum of deposits                   |
+| `ContractError::StartTimeInPast`                                        | `create_stream` / `create_streams` | start_time < ledger timestamp                 |
+| `ContractError::StreamAlreadyPaused` (10)                               | `pause_stream`                     | Double pause                                  |
+| `ContractError::StreamNotPaused` (11)                                   | `resume_stream`                    | Resume active stream                          |
+| `ContractError::StreamTerminalState` (12)                               | `pause_stream` / `resume_stream`   | Modification past end_time                    |
+| `ContractError::StreamNotFound` (1)                                     | Various                            | Invalid stream_id                             |
+| `ContractError::Unauthorized` (6)                                       | Various                            | Auth check failed                             |
+| `ContractError::InvalidState` (2)                                       | `withdraw`                         | Withdraw from non-terminal paused             |
+| `ContractError::InvalidState` (2)                                       | `cancel_stream`                    | Cancel completed/cancelled                    |
+| `"can only close completed streams"`                                    | `close_completed_stream`           | Close non-Completed stream                    |
+| `"contract not initialised: missing config"`                            | Functions requiring config         | Config missing                                |
 
 ## Error Reference
 
